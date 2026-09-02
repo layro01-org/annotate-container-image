@@ -1,0 +1,128 @@
+name: Annotate Container Image
+description: >
+  Writes commit SHA, repo URL, and ref as OCI image manifest annotations so that
+  'deployment resolve' can display commit provenance for deployed container images.
+  Supports wrap mode (outputs annotation strings for docker/build-push-action) and
+  post-hoc mode (annotates an already-pushed image using crane mutate).
+
+inputs:
+  mode:
+    description: >
+      'wrap': compute and output annotation key=value pairs only — pass to
+      docker/build-push-action's annotations: input. No network calls are made
+      and the image digest is not changed.
+      'post-hoc': apply annotations directly to an already-pushed image using
+      crane mutate. Creates a new manifest; the original digest is superseded.
+    required: false
+    default: 'wrap'
+  image-ref:
+    description: >
+      Full image reference to annotate (required for post-hoc mode).
+      Accepts tag or digest form: registry/repo:tag or registry/repo@sha256:…
+    required: false
+    default: ''
+  build-context:
+    description: Docker build context path relative to the repo root.
+    required: false
+    default: '.'
+
+outputs:
+  annotations:
+    description: >
+      Newline-separated key=value annotation pairs, suitable for passing
+      directly to docker/build-push-action's annotations: input.
+    value: ${{ steps.compute.outputs.annotations }}
+  head-sha:
+    description: >
+      Resolved head commit SHA. On pull_request events this is the PR head
+      commit (not the ephemeral merge commit that github.sha returns).
+    value: ${{ steps.compute.outputs.head_sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute provenance values
+      id: compute
+      shell: bash
+      env:
+        # Use explicit env vars rather than ${{ expr }} inline to avoid
+        # injection via repo name or ref values.
+        _EVENT_NAME: ${{ github.event_name }}
+        _PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        _GITHUB_SHA: ${{ github.sha }}
+        _SERVER_URL: ${{ github.server_url }}
+        _REPOSITORY: ${{ github.repository }}
+        _REF: ${{ github.ref }}
+        _WORKFLOW_REF: ${{ github.workflow_ref }}
+        _RUN_ID: ${{ github.run_id }}
+        _BUILD_CONTEXT: ${{ inputs.build-context }}
+      run: |
+        # On pull_request events github.sha is the ephemeral merge commit that
+        # GitHub creates to run CI; it disappears when the PR closes. Use the
+        # actual PR head SHA when available.
+        if [[ "$_EVENT_NAME" == "pull_request" && -n "$_PR_HEAD_SHA" ]]; then
+          HEAD_SHA="$_PR_HEAD_SHA"
+        else
+          HEAD_SHA="$_GITHUB_SHA"
+        fi
+
+        # Detect a dirty worktree. In normal CI checkouts this should never
+        # fire; the annotation makes unexpected modifications observable.
+        DIRTY="false"
+        if git rev-parse --is-inside-work-tree &>/dev/null; then
+          if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+            DIRTY="true"
+          fi
+        fi
+
+        SOURCE_URL="${_SERVER_URL}/${_REPOSITORY}"
+        CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        # Write multiline output using GitHub Actions heredoc syntax.
+        {
+          echo "head_sha=${HEAD_SHA}"
+          echo "annotations<<PROVENANCE_EOF"
+          echo "org.opencontainers.image.revision=${HEAD_SHA}"
+          echo "org.opencontainers.image.source=${SOURCE_URL}"
+          echo "org.opencontainers.image.ref.name=${_REF}"
+          echo "org.opencontainers.image.created=${CREATED}"
+          echo "com.veracode.provenance.head-sha=${HEAD_SHA}"
+          echo "com.veracode.provenance.workflow-ref=${_WORKFLOW_REF}"
+          echo "com.veracode.provenance.run-id=${_RUN_ID}"
+          echo "com.veracode.provenance.build-context=${_BUILD_CONTEXT}"
+          echo "com.veracode.provenance.signing=pending"
+          if [[ "$DIRTY" == "true" ]]; then
+            echo "com.veracode.provenance.worktree-dirty=true"
+          fi
+          echo "PROVENANCE_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    # Post-hoc mode: apply annotations to an already-pushed image.
+    # This creates a new manifest with a new digest; the tag is updated.
+    - name: Annotate existing image (post-hoc)
+      if: inputs.mode == 'post-hoc'
+      shell: bash
+      env:
+        _IMAGE_REF: ${{ inputs.image-ref }}
+        _ANNOTATIONS: ${{ steps.compute.outputs.annotations }}
+      run: |
+        if [[ -z "$_IMAGE_REF" ]]; then
+          echo "::error::image-ref is required when mode=post-hoc"
+          exit 1
+        fi
+
+        if ! command -v crane &>/dev/null; then
+          go install github.com/google/go-containerregistry/cmd/crane@latest
+        fi
+
+        # Build --annotation flags from the multiline annotations output.
+        CRANE_ARGS=()
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          CRANE_ARGS+=(--annotation "$line")
+        done <<< "$_ANNOTATIONS"
+
+        crane mutate "${CRANE_ARGS[@]}" "$_IMAGE_REF"
+
+        echo "::notice::Annotated ${_IMAGE_REF} with commit provenance."
+        echo "::warning::Post-hoc annotation creates a new manifest digest. Any previously pinned digest for this image is now superseded."
